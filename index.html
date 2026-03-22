@@ -354,6 +354,8 @@ body{font-family:'Plus Jakarta Sans',sans-serif;background:var(--bg);color:var(-
     <p class="field-note" style="margin-top:8px">
       💡 CSV format: <code style="font-size:11px;background:#F4F5F8;padding:1px 5px;border-radius:4px">q_no,question,opt_A,opt_B,opt_C,opt_D,answer</code><br>
       📄 DOCX Part 5/7: <code style="font-size:11px;background:#F4F5F8;padding:1px 5px;border-radius:4px">101. question (A) opt (B) opt (C) opt (D) opt</code><br>
+      📄 DOCX Part 7 compact: <code style="font-size:11px;background:#F4F5F8;padding:1px 5px;border-radius:4px">Question 147. text A. opt B. opt C. opt D. opt → Đáp án: D</code><br>
+      📄 DOCX Part 6: <code style="font-size:11px;background:#F4F5F8;padding:1px 5px;border-radius:4px">Questions 131-134 refer to... / passage / 131. (A) opt (B) opt... / → Đáp án: X</code><br>
       📋 DOCX Part 3/4: định dạng PHẦN 1 (câu hỏi) + PHẦN 2 (đáp án) — gộp thành 1 đề
     </p>
     <div id="upload-progress" style="display:none;margin-top:12px">
@@ -1043,7 +1045,91 @@ function parseFormatDot(text, examId, examName) {
   return questions;
 }
 
-// Detect Part 7 format
+// Detect Part 6 format (fill-in-blank: passages + (A)(B)(C)(D) options + inline answers)
+function isPart6(text) {
+  return /Questions\s+\d+[\u2013\-]\s*\d+\s+refer to the following/i.test(text) &&
+         /\(A\)/i.test(text) &&
+         /→\s*Đáp án\s*:/i.test(text);
+}
+
+// Parse Part 6 text → array of question objects
+function parsePart6Text(rawText, examId, examName) {
+  const text = rawText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  // 1. Map each q_no → passage text from "Questions X-Y refer to..." groups
+  const groupMap = {};
+  const groupRe = /Questions\s+(\d+)[\u2013\-]\s*(\d+)\s+refer to the following\s*([^\n]*)/gi;
+  const groupPos = [];
+  let gm;
+  while ((gm = groupRe.exec(text)) !== null) {
+    groupPos.push({ start: parseInt(gm[1]), end: parseInt(gm[2]), type: gm[3].trim(), matchEnd: gm.index + gm[0].length, index: gm.index });
+  }
+  for (let i = 0; i < groupPos.length; i++) {
+    const g = groupPos[i];
+    const nextIdx = i < groupPos.length - 1 ? groupPos[i + 1].index : text.length;
+    const section = text.slice(g.matchEnd, nextIdx);
+    const firstQRe = new RegExp(`(^|\\n)\\s*${g.start}\\.`);
+    const firstQIdx = section.search(firstQRe);
+    const passage = (firstQIdx > 0 ? section.slice(0, firstQIdx) : section).trim();
+    for (let qno = g.start; qno <= g.end; qno++) groupMap[String(qno)] = { passage, type: g.type };
+  }
+
+  // 2. Parse each question line: "131. (A) opt (B) opt (C) opt (D) opt"
+  const lines = text.split('\n');
+  const questions = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    const qMatch = line.match(/^(\d{3})\.\s*\(A\)\s*([\s\S]+?)\s*\(B\)\s*([\s\S]+?)\s*\(C\)\s*([\s\S]+?)\s*\(D\)\s*([\s\S]+)$/i);
+    if (!qMatch) continue;
+    const qno = parseInt(qMatch[1]);
+    let answer = '';
+    for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+      const ansMatch = lines[j].match(/→\s*Đáp án\s*:\s*([A-D])/i);
+      if (ansMatch) { answer = ansMatch[1].toUpperCase(); break; }
+    }
+    const group = groupMap[String(qno)];
+    questions.push({
+      exam_id: examId, exam_name: examName,
+      q_no: qno, question: `Điền vào ô trống ___${qno}___`,
+      opt_A: qMatch[2].trim(), opt_B: qMatch[3].trim(),
+      opt_C: qMatch[4].trim(), opt_D: qMatch[5].trim(),
+      answer, passage: group?.passage || '', exam_type: 'part6',
+    });
+  }
+  return questions.sort((a, b) => a.q_no - b.q_no);
+}
+
+// Detect compact Part 7 (Question NNN. text A. opt ... + inline answers, no passage in doc)
+function isCompactPart7(text) {
+  return /^Question\s+\d+\./im.test(text) && /→\s*Đáp án\s*:/i.test(text);
+}
+
+// Parse compact Part 7 → array of question objects
+function parseCompactPart7(rawText, examId, examName) {
+  const lines = rawText.split('\n');
+  const questions = [];
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    const qMatch = line.match(/^Question\s+(\d+)\.\s+([\s\S]+?)\s+A\.\s+([\s\S]+?)\s+B\.\s+([\s\S]+?)\s+C\.\s+([\s\S]+?)\s+D\.\s+([\s\S]+)$/i);
+    if (!qMatch) continue;
+    const qno = parseInt(qMatch[1]);
+    let answer = '';
+    for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+      const ansMatch = lines[j].match(/→\s*Đáp án\s*:\s*([A-D])/i);
+      if (ansMatch) { answer = ansMatch[1].toUpperCase(); break; }
+    }
+    questions.push({
+      exam_id: examId, exam_name: examName,
+      q_no: qno, question: qMatch[2].trim(),
+      opt_A: qMatch[3].trim(), opt_B: qMatch[4].trim(),
+      opt_C: qMatch[5].trim(), opt_D: qMatch[6].trim(),
+      answer, passage: '', exam_type: 'part7',
+    });
+  }
+  return questions.sort((a, b) => a.q_no - b.q_no);
+}
+
+// Detect Part 7 format (standard ETS: passages + separate ANSWER KEY section)
 function isPart7(text) {
   return /Questions\s+\d+[\u2013\-]\s*\d+\s+refer to the following/i.test(text);
 }
@@ -1186,8 +1272,14 @@ async function parseDocxFile(file, examId, examName) {
   // Multi-file format (PHẦN 1/PHẦN 2 + FILE X blocks) → 1 đề duy nhất
   if (isMultiFileDocx(rawText)) return parseMultiFileDocx(rawText, examId, examName);
 
-  // Nếu là Part 7 → dùng parser riêng
+  // Part 6: fill-in-blank với passage + (A)(B)(C)(D) + inline answers (check trước Part 7)
+  if (isPart6(rawText)) return parsePart6Text(rawText, examId, examName);
+
+  // Part 7 chuẩn ETS: passages riêng + ANSWER KEY section cuối
   if (isPart7(rawText)) return parsePart7Text(rawText, examId, examName);
+
+  // Part 7 compact: Question NNN. text A. opt ... → Đáp án: X (không có passage)
+  if (isCompactPart7(rawText)) return parseCompactPart7(rawText, examId, examName);
 
   // Part 5: collapse về 1 dòng rồi dùng parser cũ
   const text = rawText.replace(/\s+/g, ' ').trim();
@@ -1224,9 +1316,10 @@ async function handleUpload() {
     let questions;
     if (ext === 'txt') {
       const rawTxt = await file.text();
-      questions = isPart7(rawTxt)
-        ? parsePart7Text(rawTxt, id, examName)
-        : await parseCsvFile(file, id, examName);
+      if (isPart6(rawTxt)) questions = parsePart6Text(rawTxt, id, examName);
+      else if (isPart7(rawTxt)) questions = parsePart7Text(rawTxt, id, examName);
+      else if (isCompactPart7(rawTxt)) questions = parseCompactPart7(rawTxt, id, examName);
+      else questions = await parseCsvFile(file, id, examName);
     } else if (ext === 'csv') {
       questions = await parseCsvFile(file, id, examName);
     } else {
@@ -1335,7 +1428,7 @@ function renderQuestion() {
 
   // Detect Part 7 — widen quiz wrap and use split-screen layout
   const passage = q.passage || '';
-  const isP7 = q.exam_type === 'part7' && passage;
+  const isP7 = (q.exam_type === 'part7' || q.exam_type === 'part6') && passage;
   document.querySelector('.quiz-wrap').classList.toggle('quiz-wrap-p7', !!isP7);
 
   const partBadge = q.sim_part
@@ -1348,7 +1441,7 @@ function renderQuestion() {
       <div class="q-number">Câu ${q.q_no} — ${S.examName}</div>
       <div class="p7-layout">
         <div class="p7-left">
-          <div class="p7-left-label">📄 Đoạn văn tham khảo</div>
+          <div class="p7-left-label">${q.exam_type === 'part6' ? '📝 Đoạn văn (điền chỗ trống)' : '📄 Đoạn văn tham khảo'}</div>
           <div class="p7-passage">
             <div class="p7-passage-body">${escHtml(passage)}</div>
           </div>
