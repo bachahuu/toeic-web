@@ -1045,58 +1045,92 @@ function parseFormatDot(text, examId, examName) {
   return questions;
 }
 
-// Detect Part 6 format (fill-in-blank: passages + (A)(B)(C)(D) options + inline answers)
+// Detect Part 6 format (fill-in-blank: passages + (A)(B)(C)(D) options + PHẦN 2 answer section)
 function isPart6(text) {
   return /Questions\s+\d+[\u2013\-]\s*\d+\s+refer to the following/i.test(text) &&
          /\(A\)/i.test(text) &&
-         /→\s*Đáp án\s*:/i.test(text);
+         /PHẦN\s*2/i.test(text);
 }
 
 // Parse Part 6 text → array of question objects
+// Hỗ trợ nhiều sub-section (PART 6_1, PART 6_2, ...) trong cùng 1 file
 function parsePart6Text(rawText, examId, examName) {
   const text = rawText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-  // 1. Map each q_no → passage text from "Questions X-Y refer to..." groups
-  const groupMap = {};
-  const groupRe = /Questions\s+(\d+)[\u2013\-]\s*(\d+)\s+refer to the following\s*([^\n]*)/gi;
-  const groupPos = [];
-  let gm;
-  while ((gm = groupRe.exec(text)) !== null) {
-    groupPos.push({ start: parseInt(gm[1]), end: parseInt(gm[2]), type: gm[3].trim(), matchEnd: gm.index + gm[0].length, index: gm.index });
+  // Tách thành từng sub-section theo marker "PART 6_X"
+  // Mỗi sub-section có PHẦN 1 (câu hỏi) + PHẦN 2 (đáp án) độc lập
+  const secRe = /(?:^|\n)(PART\s+6_\d+)/gi;
+  const secStarts = [];
+  let sm;
+  while ((sm = secRe.exec(text)) !== null) {
+    secStarts.push(sm.index === 0 ? 0 : sm.index + 1);
   }
-  for (let i = 0; i < groupPos.length; i++) {
-    const g = groupPos[i];
-    const nextIdx = i < groupPos.length - 1 ? groupPos[i + 1].index : text.length;
-    const section = text.slice(g.matchEnd, nextIdx);
-    const firstQRe = new RegExp(`(^|\\n)\\s*${g.start}\\.`);
-    const firstQIdx = section.search(firstQRe);
-    const passage = (firstQIdx > 0 ? section.slice(0, firstQIdx) : section).trim();
-    for (let qno = g.start; qno <= g.end; qno++) groupMap[String(qno)] = { passage, type: g.type };
+  const sections = secStarts.length > 0
+    ? secStarts.map((s, i) => text.slice(s, i < secStarts.length - 1 ? secStarts[i + 1] : text.length))
+    : [text]; // Nếu không có marker thì xử lý như 1 section
+
+  const allQuestions = [];
+  let qNoOffset = 0; // Cộng dồn để tránh trùng q_no giữa các sub-section
+
+  for (const sec of sections) {
+    // Tìm PHẦN 2 trong section này
+    const p2Idx = sec.search(/PHẦN\s*2/i);
+    const phan1 = p2Idx > 0 ? sec.slice(0, p2Idx) : sec;
+    const phan2 = p2Idx > 0 ? sec.slice(p2Idx) : '';
+
+    // Xây answer map từ PHẦN 2 của section này: "NNN\n(X) text"
+    const answerMap = {};
+    const p2Lines = phan2.split('\n').map(l => l.trim()).filter(Boolean);
+    for (let i = 0; i < p2Lines.length - 1; i++) {
+      if (/^\d{3}$/.test(p2Lines[i])) {
+        const ansMatch = p2Lines[i + 1].match(/^\(([A-D])\)/i);
+        if (ansMatch) answerMap[p2Lines[i]] = ansMatch[1].toUpperCase();
+      }
+    }
+
+    // Map q_no → passage từ group headers trong PHẦN 1
+    const groupMap = {};
+    const groupRe = /Questions\s+(\d+)[\u2013\-]\s*(\d+)\s+refer to the following\s*([^\n]*)/gi;
+    const groupPos = [];
+    let gm;
+    while ((gm = groupRe.exec(phan1)) !== null) {
+      groupPos.push({ start: parseInt(gm[1]), end: parseInt(gm[2]), type: gm[3].trim(), matchEnd: gm.index + gm[0].length, index: gm.index });
+    }
+    for (let i = 0; i < groupPos.length; i++) {
+      const g = groupPos[i];
+      const nextIdx = i < groupPos.length - 1 ? groupPos[i + 1].index : phan1.length;
+      const chunk = phan1.slice(g.matchEnd, nextIdx);
+      const firstQRe = new RegExp(`(^|\\n)\\s*${g.start}\\.`);
+      const firstQIdx = chunk.search(firstQRe);
+      const passage = (firstQIdx > 0 ? chunk.slice(0, firstQIdx) : chunk).trim();
+      for (let qno = g.start; qno <= g.end; qno++) groupMap[String(qno)] = { passage, type: g.type };
+    }
+
+    // Parse câu hỏi: "NNN. (A) opt (B) opt (C) opt (D) opt"
+    const secQuestions = [];
+    for (const line of phan1.split('\n')) {
+      const qMatch = line.trim().match(/^(\d{3})\.\s*\(A\)\s*([\s\S]+?)\s*\(B\)\s*([\s\S]+?)\s*\(C\)\s*([\s\S]+?)\s*\(D\)\s*([\s\S]+)$/i);
+      if (!qMatch) continue;
+      const origQno = parseInt(qMatch[1]);
+      const group = groupMap[String(origQno)];
+      secQuestions.push({
+        exam_id: examId, exam_name: examName,
+        q_no: origQno + qNoOffset,
+        question: `Điền vào ô trống ___${origQno}___`,
+        opt_A: qMatch[2].trim(), opt_B: qMatch[3].trim(),
+        opt_C: qMatch[4].trim(), opt_D: qMatch[5].trim(),
+        answer: answerMap[String(origQno)] || '',
+        passage: group?.passage || '', exam_type: 'part6',
+      });
+    }
+
+    if (secQuestions.length > 0) {
+      qNoOffset += secQuestions.length; // Offset section tiếp theo
+      allQuestions.push(...secQuestions);
+    }
   }
 
-  // 2. Parse each question line: "131. (A) opt (B) opt (C) opt (D) opt"
-  const lines = text.split('\n');
-  const questions = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    const qMatch = line.match(/^(\d{3})\.\s*\(A\)\s*([\s\S]+?)\s*\(B\)\s*([\s\S]+?)\s*\(C\)\s*([\s\S]+?)\s*\(D\)\s*([\s\S]+)$/i);
-    if (!qMatch) continue;
-    const qno = parseInt(qMatch[1]);
-    let answer = '';
-    for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
-      const ansMatch = lines[j].match(/→\s*Đáp án\s*:\s*([A-D])/i);
-      if (ansMatch) { answer = ansMatch[1].toUpperCase(); break; }
-    }
-    const group = groupMap[String(qno)];
-    questions.push({
-      exam_id: examId, exam_name: examName,
-      q_no: qno, question: `Điền vào ô trống ___${qno}___`,
-      opt_A: qMatch[2].trim(), opt_B: qMatch[3].trim(),
-      opt_C: qMatch[4].trim(), opt_D: qMatch[5].trim(),
-      answer, passage: group?.passage || '', exam_type: 'part6',
-    });
-  }
-  return questions.sort((a, b) => a.q_no - b.q_no);
+  return allQuestions.sort((a, b) => a.q_no - b.q_no);
 }
 
 // Detect compact Part 7 (Question NNN. text A. opt ... + inline answers, no passage in doc)
@@ -1261,6 +1295,7 @@ async function parseDocxFile(file, examId, examName) {
     .replace(/<w:p[\s\/>]/g, '\n')   // Mỗi paragraph → xuống dòng mới
     .replace(/<w:tab[^>]*>/g, '\t')  // Tab
     .replace(/<[^>]+>/g, '')         // Strip toàn bộ XML tags
+    .replace(/^[^>\n]+>/gm, '')      // Strip XML attribute noise còn sót (w14:paraId="...">)
     .replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&nbsp;/g,' ')
     .replace(/&ndash;/g,'\u2013').replace(/&mdash;/g,'\u2014').replace(/&apos;/g,"'").replace(/&quot;/g,'"')
     .replace(/&#x([0-9a-fA-F]+);/g, (_,h) => String.fromCharCode(parseInt(h,16)))
